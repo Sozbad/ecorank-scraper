@@ -60,7 +60,7 @@ def assign_categories(product_name, description):
 
 def scrape_product(product_name):
     search_url = f"https://www.chemical-safety.com/sds-search/?q={product_name.replace(' ', '+')}"
-    response = requests.get(search_url)
+    response = requests.get(search_url, verify=False)
     if response.status_code != 200:
         return None
 
