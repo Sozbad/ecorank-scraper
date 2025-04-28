@@ -1,110 +1,44 @@
-# scraper.py
-import requests
-from bs4 import BeautifulSoup
-import firebase_admin
-from firebase_admin import credentials, firestore
-import datetime
+import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 
-# Firestore init
-if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
+const History = () => {
+  const [history, setHistory] = useState([]);
+  const navigate = useNavigate();
 
-# Hazard to score mappings
-hazard_mapping = {
-    "flammable": {"health": 1, "environment": 0, "disposal": 1},
-    "toxic": {"health": 3, "environment": 2, "disposal": 2},
-    "corrosive": {"health": 2, "environment": 1, "disposal": 2},
-    "environment": {"health": 0, "environment": 3, "disposal": 2},
-    "health hazard": {"health": 3, "environment": 1, "disposal": 1}
-}
+  useEffect(() => {
+    const storedHistory = JSON.parse(localStorage.getItem("searchHistory")) || [];
+    setHistory(storedHistory);
+  }, []);
 
-# Category mapping
-category_keywords = {
-    "lubricant": ("Lubricants", "Multi-Purpose Lubricants"),
-    "bike": ("Lubricants", "Bicycle Chain Lubricants"),
-    "coolant": ("Car Care", "Coolants"),
-    "paint": ("Paints", "Spray Paints"),
-    "de-icer": ("Car Care", "De-Icers"),
-    "cleaner": ("Cleaning Products", "Surface Cleaners"),
-    "graffiti remover": ("Cleaning Products", "Graffiti Remover"),
-    "wood stain": ("Wood Treatments", "Exterior Wood Stain"),
-    "varnish": ("Wood Treatments", "Wood Varnishes"),
-    "adhesive": ("Glues & Adhesives", "Multi-Purpose Adhesives"),
-    "sanitiser": ("Cleaning Products", "Sanitisers"),
-}
+  const handleProductClick = (product) => {
+    navigate(`/product/${product.id}`);
+  };
 
-def score_product(hazards):
-    base_score = 10.0
-    health = environment = disposal = 0
+  return (
+    <div className="min-h-screen bg-[#e6f4e8] py-10 px-4">
+      <div className="max-w-4xl mx-auto">
+        <h1 className="text-2xl font-bold text-[#2e7d32] mb-8">Your Search History</h1>
 
-    for hazard in hazards:
-        hazard = hazard.lower()
-        mapping = hazard_mapping.get(hazard)
-        if mapping:
-            health += mapping["health"]
-            environment += mapping["environment"]
-            disposal += mapping["disposal"]
+        {history.length === 0 ? (
+          <p className="text-gray-600">You have no recent products viewed yet.</p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {history.map((item, index) => (
+              <div
+                key={index}
+                onClick={() => handleProductClick(item)}
+                className="bg-white rounded-lg shadow-md p-4 hover:bg-green-100 cursor-pointer"
+              >
+                <h2 className="text-lg font-bold mb-2">{item.name}</h2>
+                <p className="text-sm">Score: {item.score !== null ? item.score : "N/A"}</p>
+                <p className="text-sm">Category: {item.primary_category}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
-    score = base_score - (0.5 * health) - (0.5 * environment) - (0.5 * disposal)
-    score = max(0.0, round(score, 1))
-    return score, health, environment, disposal
-
-def assign_categories(product_name, description):
-    text = (product_name + " " + description).lower()
-    for keyword, (primary, sub) in category_keywords.items():
-        if keyword in text:
-            return primary, sub
-    return "Other", "General Purpose"
-
-def scrape_product(product_name):
-    search_url = f"https://www.chemical-safety.com/sds-search/?q={product_name.replace(' ', '+')}"
-    response = requests.get(search_url, verify=False)
-    if response.status_code != 200:
-        return None
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    first_result = soup.find("div", class_="product-listing")
-
-    if not first_result:
-        return None
-
-    title = first_result.find("h2").get_text(strip=True)
-    description = first_result.find("p").get_text(strip=True) if first_result.find("p") else ""
-    sds_link_tag = first_result.find("a", href=True)
-    sds_url = sds_link_tag['href'] if sds_link_tag else ""
-
-    # Fake hazard extraction (Chemical Safety sometimes doesn't show on listing)
-    # You would scrape inside SDS if needed - here we assume a set for now
-    hazards = ["Flammable", "Health Hazard", "Environment"]
-
-    score, health, environment, disposal = score_product(hazards)
-    recommended = score >= 7.0
-    primary_category, subcategory = assign_categories(product_name, description)
-
-    now = datetime.datetime.utcnow().isoformat() + "Z"
-
-    product_data = {
-        "name": title,
-        "description": description,
-        "image": "",  # Optional to scrape later
-        "sds_url": sds_url,
-        "hazards": hazards,
-        "hazard_codes": [],
-        "health": health,
-        "environment": environment,
-        "disposal": disposal,
-        "score": score,
-        "recommended": recommended,
-        "primary_category": primary_category,
-        "subcategory": subcategory,
-        "categories": [primary_category],
-        "barcode": "",
-        "certifications": [],
-        "last_scraped": now
-    }
-
-    # Upload to Firestore
-    db.collection("products").add(product_data)
-    return product_data
+export default History;
