@@ -6,7 +6,7 @@ import datetime
 import re
 from sds_parser import parse_sds_pdf
 
-# Initialize Firebase
+# Firebase init
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
@@ -33,12 +33,8 @@ def assign_disposal_advice(hazard_codes):
 
 def build_product(name, description, hazard_codes, source, sds_url, disposal, data_quality):
     now = datetime.datetime.utcnow().isoformat() + "Z"
-    if not hazard_codes:
-        score = 0
-        recommended = False
-    else:
-        score = max(0, 10 - len(hazard_codes))
-        recommended = score >= 7
+    score = max(0, 10 - len(hazard_codes)) if hazard_codes else 0
+    recommended = score >= 7 if hazard_codes else False
 
     return {
         "name": name or "not found",
@@ -95,7 +91,7 @@ def scrape_chemical_safety(product_name):
         desc = detail_soup.find("p").get_text(strip=True) if detail_soup.find("p") else ""
 
         if not h_codes and detail_url and detail_url.endswith(".pdf"):
-            print("📄 No hazards found, parsing SDS PDF...")
+            print("📄 Parsing SDS fallback...")
             parsed = parse_sds_pdf(detail_url)
             h_codes = parsed["hazard_codes"]
             disposal = parsed["disposal"]
@@ -104,7 +100,7 @@ def scrape_chemical_safety(product_name):
             disposal = assign_disposal_advice(h_codes)
             data_quality = "hazards found"
 
-        print(f"✅ Found on Chemical Safety: {name}")
+        print(f"✅ Chemical Safety success: {name}")
         return build_product(name, desc, h_codes, "Chemical Safety", detail_url, disposal, data_quality)
     except Exception as e:
         print(f"❌ Chemical Safety error: {e}")
@@ -117,12 +113,12 @@ def scrape_screwfix(product_name):
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        first = soup.select_one(".SearchResults .productBox .productDescription")
-        if not first:
+        product = soup.select_one(".SearchResults .productBox")
+        if not product:
             print("❌ Screwfix: No match")
             return None
-        name = first.text.strip()
-        print(f"✅ Found on Screwfix: {name}")
+        name = product.select_one(".productDescription").text.strip()
+        print(f"✅ Screwfix success: {name}")
         return build_product(name, "not found", [], "Screwfix", url, "not found", "limited")
     except Exception as e:
         print(f"❌ Screwfix error: {e}")
@@ -145,9 +141,9 @@ def scrape_amazon(product_name):
             or "results for" in title_text.lower()
             or len(title_text) < 5
         ):
-            print(f"❌ Amazon: Skipping generic match — {title_text}")
+            print(f"❌ Amazon: Skipping match — {title_text}")
             return None
-        print(f"✅ Found on Amazon: {title_text}")
+        print(f"✅ Amazon success: {title_text}")
         return build_product(title_text, "not found", [], "Amazon", url, "not found", "limited")
     except Exception as e:
         print(f"❌ Amazon error: {e}")
@@ -158,11 +154,22 @@ def scrape_product(product_name):
     if cached:
         return cached
 
-    for scraper in [scrape_chemical_safety, scrape_screwfix, scrape_amazon]:
-        result = scraper(product_name)
-        if result:
-            save_to_firestore(result)
-            return result
+    attempts = [product_name]
+    if "-" in product_name:
+        attempts.append(product_name.replace("-", ""))
+    if " " in product_name:
+        parts = product_name.split()
+        if len(parts) > 1:
+            attempts.append(parts[0])
+            attempts.append(parts[-1])
+
+    for attempt in attempts:
+        print(f"🔁 Trying: {attempt}")
+        for scraper in [scrape_chemical_safety, scrape_screwfix, scrape_amazon]:
+            result = scraper(attempt)
+            if result:
+                save_to_firestore(result)
+                return result
 
     print("❌ All scrapers failed.")
     return {"error": "Product not found"}
