@@ -4,8 +4,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import datetime
 import re
+from sds_parser import parse_sds_pdf
 
-# Initialize Firebase if not already
+# Initialize Firebase
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
@@ -30,16 +31,14 @@ def assign_disposal_advice(hazard_codes):
     else:
         return "Dispose of contents and container in general waste only if permitted by local guidelines."
 
-def build_product(name, description, hazard_codes, source, sds_url):
+def build_product(name, description, hazard_codes, source, sds_url, disposal, data_quality):
     now = datetime.datetime.utcnow().isoformat() + "Z"
     if not hazard_codes:
         score = 0
         recommended = False
-        data_quality = "no hazard data"
     else:
         score = max(0, 10 - len(hazard_codes))
         recommended = score >= 7
-        data_quality = "hazards found"
 
     return {
         "name": name or "not found",
@@ -58,7 +57,7 @@ def build_product(name, description, hazard_codes, source, sds_url):
         "subcategory": "not found",
         "health": None,
         "environment": None,
-        "disposal": assign_disposal_advice(hazard_codes),
+        "disposal": disposal,
         "last_scraped": now,
         "disclaimer": DISCLAIMER,
         "data_quality": data_quality
@@ -94,8 +93,19 @@ def scrape_chemical_safety(product_name):
         h_codes = list(set(re.findall(r"H\d{3}", text)))
         name = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else product_name
         desc = detail_soup.find("p").get_text(strip=True) if detail_soup.find("p") else ""
+
+        if not h_codes and detail_url and detail_url.endswith(".pdf"):
+            print("📄 No hazards found, parsing SDS PDF...")
+            parsed = parse_sds_pdf(detail_url)
+            h_codes = parsed["hazard_codes"]
+            disposal = parsed["disposal"]
+            data_quality = parsed["data_quality"]
+        else:
+            disposal = assign_disposal_advice(h_codes)
+            data_quality = "hazards found"
+
         print(f"✅ Found on Chemical Safety: {name}")
-        return build_product(name, desc, h_codes, "Chemical Safety", detail_url)
+        return build_product(name, desc, h_codes, "Chemical Safety", detail_url, disposal, data_quality)
     except Exception as e:
         print(f"❌ Chemical Safety error: {e}")
         return None
@@ -113,7 +123,7 @@ def scrape_screwfix(product_name):
             return None
         name = first.text.strip()
         print(f"✅ Found on Screwfix: {name}")
-        return build_product(name, "not found", [], "Screwfix", url)
+        return build_product(name, "not found", [], "Screwfix", url, "not found", "limited")
     except Exception as e:
         print(f"❌ Screwfix error: {e}")
         return None
@@ -129,7 +139,6 @@ def scrape_amazon(product_name):
         if not title_element:
             print("❌ Amazon: No product found")
             return None
-
         title_text = title_element.text.strip()
         if (
             not title_text
@@ -138,10 +147,8 @@ def scrape_amazon(product_name):
         ):
             print(f"❌ Amazon: Skipping generic match — {title_text}")
             return None
-
         print(f"✅ Found on Amazon: {title_text}")
-        return build_product(title_text, "not found", [], "Amazon", url)
-
+        return build_product(title_text, "not found", [], "Amazon", url, "not found", "limited")
     except Exception as e:
         print(f"❌ Amazon error: {e}")
         return None
