@@ -19,6 +19,8 @@ DISCLAIMER = (
 )
 
 def assign_disposal_advice(hazard_codes):
+    if not hazard_codes:
+        return "not found"
     if any(code.startswith("H2") for code in hazard_codes):
         return "Do not dispose in household waste. Take to a hazardous waste collection point or consult your council for flammable product disposal."
     elif any(code.startswith("H3") for code in hazard_codes):
@@ -29,31 +31,39 @@ def assign_disposal_advice(hazard_codes):
         return "Dispose of contents and container in general waste only if permitted by local guidelines."
 
 def build_product(name, description, hazard_codes, source, sds_url):
-    score = max(0, 10 - len(hazard_codes))
     now = datetime.datetime.utcnow().isoformat() + "Z"
+    if not hazard_codes:
+        score = 0
+        recommended = False
+        data_quality = "no hazard data"
+    else:
+        score = max(0, 10 - len(hazard_codes))
+        recommended = score >= 7
+        data_quality = "hazards found"
+
     return {
-        "name": name,
-        "description": description,
-        "hazards": [],  # Can be enhanced later
-        "hazard_codes": hazard_codes,
+        "name": name or "not found",
+        "description": description or "not found",
+        "hazards": [],
+        "hazard_codes": hazard_codes or [],
         "score": score,
-        "recommended": score >= 7,
-        "sds_url": sds_url,
+        "recommended": recommended,
+        "sds_url": sds_url or "not found",
         "source": source,
-        "image": "",
-        "barcode": "",
+        "image": "not found",
+        "barcode": "not found",
         "certifications": [],
         "categories": [],
-        "primary_category": "",
-        "subcategory": "",
+        "primary_category": "not found",
+        "subcategory": "not found",
         "health": None,
         "environment": None,
         "disposal": assign_disposal_advice(hazard_codes),
         "last_scraped": now,
-        "disclaimer": DISCLAIMER
+        "disclaimer": DISCLAIMER,
+        "data_quality": data_quality
     }
 
-# Check Firestore cache first
 def check_firestore_cache(product_name):
     docs = db.collection("products").where("name", "==", product_name).stream()
     for doc in docs:
@@ -66,7 +76,6 @@ def save_to_firestore(product):
     db.collection("products").add(product)
     print(f"✅ Saved to Firestore: {product['name']}")
 
-# Chemical Safety Scraper
 def scrape_chemical_safety(product_name):
     try:
         print("🔍 Trying Chemical Safety...")
@@ -91,7 +100,6 @@ def scrape_chemical_safety(product_name):
         print(f"❌ Chemical Safety error: {e}")
         return None
 
-# Screwfix fallback
 def scrape_screwfix(product_name):
     try:
         print("🔍 Trying Screwfix...")
@@ -105,12 +113,11 @@ def scrape_screwfix(product_name):
             return None
         name = first.text.strip()
         print(f"✅ Found on Screwfix: {name}")
-        return build_product(name, "", [], "Screwfix", url)
+        return build_product(name, "not found", [], "Screwfix", url)
     except Exception as e:
         print(f"❌ Screwfix error: {e}")
         return None
 
-# Amazon fallback
 def scrape_amazon(product_name):
     try:
         print("🔍 Trying Amazon...")
@@ -118,25 +125,32 @@ def scrape_amazon(product_name):
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        title = soup.select_one("h2 span")
-        if not title:
-            print("❌ Amazon: No match")
+        title_element = soup.select_one("h2 span")
+        if not title_element:
+            print("❌ Amazon: No product found")
             return None
-        name = title.text.strip()
-        print(f"✅ Found on Amazon: {name}")
-        return build_product(name, "", [], "Amazon", url)
+
+        title_text = title_element.text.strip()
+        if (
+            not title_text
+            or "results for" in title_text.lower()
+            or len(title_text) < 5
+        ):
+            print(f"❌ Amazon: Skipping generic match — {title_text}")
+            return None
+
+        print(f"✅ Found on Amazon: {title_text}")
+        return build_product(title_text, "not found", [], "Amazon", url)
+
     except Exception as e:
         print(f"❌ Amazon error: {e}")
         return None
 
-# Entry point
 def scrape_product(product_name):
-    # Step 1: Cache
     cached = check_firestore_cache(product_name)
     if cached:
         return cached
 
-    # Step 2: Scrapers
     for scraper in [scrape_chemical_safety, scrape_screwfix, scrape_amazon]:
         result = scraper(product_name)
         if result:
