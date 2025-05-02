@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 # Install necessary packages
-RUN pip install flask requests beautifulsoup4 firebase-admin
+RUN pip install flask requests beautifulsoup4 firebase-admin PyMuPDF
 
 # Copy local code to the container image
 COPY . /app
