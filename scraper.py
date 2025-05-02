@@ -5,7 +5,7 @@ from firebase_admin import credentials, firestore
 import datetime
 import re
 
-# Initialize Firestore
+# Initialize Firebase if not already
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
@@ -18,13 +18,23 @@ DISCLAIMER = (
     "No warranty is expressed or implied regarding the accuracy of these data."
 )
 
-def build_product(name, description, hazards, hazard_codes, source, sds_url=""):
+def assign_disposal_advice(hazard_codes):
+    if any(code.startswith("H2") for code in hazard_codes):
+        return "Do not dispose in household waste. Take to a hazardous waste collection point or consult your council for flammable product disposal."
+    elif any(code.startswith("H3") for code in hazard_codes):
+        return "Use appropriate PPE and dispose through a licensed chemical waste provider."
+    elif any(code.startswith("H4") for code in hazard_codes):
+        return "Hazardous to aquatic life. Do not pour into drains. Use a chemical collection site."
+    else:
+        return "Dispose of contents and container in general waste only if permitted by local guidelines."
+
+def build_product(name, description, hazard_codes, source, sds_url):
     score = max(0, 10 - len(hazard_codes))
     now = datetime.datetime.utcnow().isoformat() + "Z"
     return {
         "name": name,
         "description": description,
-        "hazards": hazards,
+        "hazards": [],  # Can be enhanced later
         "hazard_codes": hazard_codes,
         "score": score,
         "recommended": score >= 7,
@@ -38,141 +48,100 @@ def build_product(name, description, hazards, hazard_codes, source, sds_url=""):
         "subcategory": "",
         "health": None,
         "environment": None,
-        "disposal": None,
+        "disposal": assign_disposal_advice(hazard_codes),
         "last_scraped": now,
-        "disclaimer": DISCLAIMER,
+        "disclaimer": DISCLAIMER
     }
 
+# Check Firestore cache first
+def check_firestore_cache(product_name):
+    docs = db.collection("products").where("name", "==", product_name).stream()
+    for doc in docs:
+        print(f"📦 Cache hit for '{product_name}'")
+        return doc.to_dict()
+    print(f"🕵️ Cache miss for '{product_name}'")
+    return None
+
+def save_to_firestore(product):
+    db.collection("products").add(product)
+    print(f"✅ Saved to Firestore: {product['name']}")
+
+# Chemical Safety Scraper
 def scrape_chemical_safety(product_name):
     try:
-        print("Trying Chemical Safety...")
+        print("🔍 Trying Chemical Safety...")
         url = f"https://www.chemical-safety.com/sds-search/?q={product_name.replace(' ', '+')}"
         res = requests.get(url, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        result = soup.select_one("table tbody tr")
-        if not result:
-            print("Chemical Safety: No table row found")
+        table_row = soup.select_one("table tbody tr")
+        if not table_row:
+            print("❌ Chemical Safety: No results")
             return None
-        link = result.find("a")["href"]
-        detail_res = requests.get(link, verify=False, timeout=10)
-        detail = BeautifulSoup(detail_res.text, "html.parser")
-        text = detail.get_text()
-        hazard_codes = re.findall(r"H\d{3}", text)
-        name = detail.find("h1").get_text(strip=True) if detail.find("h1") else product_name
-        desc = detail.find("p").get_text(strip=True) if detail.find("p") else ""
-        print("Chemical Safety: Success")
-        return build_product(name, desc, [], list(set(hazard_codes)), "Chemical Safety", link)
+        link = table_row.find("a", href=True)
+        detail_url = link['href'] if link else None
+        detail_res = requests.get(detail_url, verify=False, timeout=10)
+        detail_soup = BeautifulSoup(detail_res.text, "html.parser")
+        text = detail_soup.get_text()
+        h_codes = list(set(re.findall(r"H\d{3}", text)))
+        name = detail_soup.find("h1").get_text(strip=True) if detail_soup.find("h1") else product_name
+        desc = detail_soup.find("p").get_text(strip=True) if detail_soup.find("p") else ""
+        print(f"✅ Found on Chemical Safety: {name}")
+        return build_product(name, desc, h_codes, "Chemical Safety", detail_url)
     except Exception as e:
-        print(f"Chemical Safety: Failed — {e}")
+        print(f"❌ Chemical Safety error: {e}")
         return None
 
-def scrape_fisher(product_name):
-    try:
-        print("Trying Fisher Scientific...")
-        url = f"https://www.fishersci.com/shop/products/{product_name.replace(' ', '-')}/"
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"Fisher: Status code {res.status_code}")
-            return None
-        soup = BeautifulSoup(res.text, "html.parser")
-        text = soup.get_text()
-        hazard_codes = re.findall(r"H\d{3}", text)
-        name = soup.find("title").text.strip()
-        print("Fisher Scientific: Success")
-        return build_product(name, "", [], list(set(hazard_codes)), "Fisher Scientific", url)
-    except Exception as e:
-        print(f"Fisher Scientific: Failed — {e}")
-        return None
-
-def scrape_sigma(product_name):
-    try:
-        print("Trying Sigma-Aldrich...")
-        url = f"https://www.sigmaaldrich.com/US/en/search/{product_name.replace(' ', '%20')}"
-        res = requests.get(url, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        first_link = soup.select_one("a.search-result__product-link")
-        if not first_link:
-            print("Sigma-Aldrich: No product link found")
-            return None
-        detail_url = "https://www.sigmaaldrich.com" + first_link["href"]
-        detail_res = requests.get(detail_url, timeout=10)
-        detail = BeautifulSoup(detail_res.text, "html.parser")
-        text = detail.get_text()
-        hazard_codes = re.findall(r"H\d{3}", text)
-        name = detail.find("h1").get_text(strip=True) if detail.find("h1") else product_name
-        print("Sigma-Aldrich: Success")
-        return build_product(name, "", [], list(set(hazard_codes)), "Sigma-Aldrich", detail_url)
-    except Exception as e:
-        print(f"Sigma-Aldrich: Failed — {e}")
-        return None
-
+# Screwfix fallback
 def scrape_screwfix(product_name):
     try:
-        print("Trying Screwfix...")
+        print("🔍 Trying Screwfix...")
         url = f"https://www.screwfix.com/search?search={product_name.replace(' ', '+')}"
-        res = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        first = soup.select_one(".SearchResults .productBox")
+        first = soup.select_one(".SearchResults .productBox .productDescription")
         if not first:
-            print("Screwfix: No product found")
-            return None
-        name = first.select_one(".productDescription").text.strip()
-        desc = name
-        print("Screwfix: Success")
-        return build_product(name, desc, [], [], "Screwfix", url)
-    except Exception as e:
-        print(f"Screwfix: Failed — {e}")
-        return None
-
-def scrape_toolstation(product_name):
-    try:
-        print("Trying Toolstation...")
-        url = f"https://www.toolstation.com/search?searchterm={product_name.replace(' ', '+')}"
-        res = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(res.text, "html.parser")
-        first = soup.select_one(".productgrid .product-title")
-        if not first:
-            print("Toolstation: No product found")
+            print("❌ Screwfix: No match")
             return None
         name = first.text.strip()
-        print("Toolstation: Success")
-        return build_product(name, "", [], [], "Toolstation", url)
+        print(f"✅ Found on Screwfix: {name}")
+        return build_product(name, "", [], "Screwfix", url)
     except Exception as e:
-        print(f"Toolstation: Failed — {e}")
+        print(f"❌ Screwfix error: {e}")
         return None
 
+# Amazon fallback
 def scrape_amazon(product_name):
     try:
-        print("Trying Amazon...")
+        print("🔍 Trying Amazon...")
         url = f"https://www.amazon.co.uk/s?k={product_name.replace(' ', '+')}"
-        res = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
         title = soup.select_one("h2 span")
         if not title:
-            print("Amazon: No product found")
+            print("❌ Amazon: No match")
             return None
         name = title.text.strip()
-        print("Amazon: Success")
-        return build_product(name, "", [], [], "Amazon", url)
+        print(f"✅ Found on Amazon: {name}")
+        return build_product(name, "", [], "Amazon", url)
     except Exception as e:
-        print(f"Amazon: Failed — {e}")
+        print(f"❌ Amazon error: {e}")
         return None
 
+# Entry point
 def scrape_product(product_name):
-    fallback_order = [
-        scrape_chemical_safety,
-        scrape_fisher,
-        scrape_sigma,
-        scrape_screwfix,
-        scrape_toolstation,
-        scrape_amazon,
-    ]
-    print(f"Starting scrape for: {product_name}")
-    for scraper in fallback_order:
+    # Step 1: Cache
+    cached = check_firestore_cache(product_name)
+    if cached:
+        return cached
+
+    # Step 2: Scrapers
+    for scraper in [scrape_chemical_safety, scrape_screwfix, scrape_amazon]:
         result = scraper(product_name)
         if result:
-            print(f"✅ Scraper matched: {result['source']}")
-            db.collection("products").add(result)
+            save_to_firestore(result)
             return result
-    print("❌ No sources matched.")
+
+    print("❌ All scrapers failed.")
     return {"error": "Product not found"}
