@@ -2,137 +2,133 @@ import os
 import re
 import requests
 import fitz  # PyMuPDF
-from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
+from bs4 import BeautifulSoup
 from firebase_admin import credentials, firestore, initialize_app
+from urllib.parse import quote
 
 app = Flask(__name__)
 
-# Firebase init (corrected method)
+# Firebase setup
 import firebase_admin
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
-    initialize_app(cred)
+    firebase_admin.initialize_app(cred)
 db = firestore.client()
 products_ref = db.collection('products')
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-def search_google_for_sds(product_name):
-    query = f"{product_name} SDS filetype:pdf"
-    for start in [0, 10]:
-        search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}&start={start}"
-        resp = requests.get(search_url, headers=HEADERS)
-        if resp.status_code != 200:
-            continue
-        soup = BeautifulSoup(resp.text, "html.parser")
+def fetch_google_results(product_name, num_pages=2):
+    query = f"{product_name} SDS"
+    results = []
+    for page in range(num_pages):
+        start = page * 10
+        url = f"https://www.google.com/search?q={quote(query)}&start={start}"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a['href']
             match = re.search(r"/url\?q=(https?[^&]+)", href)
             if match:
-                candidate = match.group(1)
-                if candidate.lower().endswith(".pdf"):
-                    head = requests.head(candidate, allow_redirects=True, headers=HEADERS)
-                    if 'application/pdf' in head.headers.get('Content-Type', ''):
-                        return candidate
-    return None
+                link = match.group(1)
+                if "pdf" in link.lower() or "sdsviewer" in link.lower() or "safety-data" in link.lower():
+                    results.append(link)
+    return results
 
-def extract_data_from_pdf(pdf_url):
+def extract_pdf_data(pdf_url):
     try:
-        response = requests.get(pdf_url, headers=HEADERS)
-        if response.status_code != 200:
+        r = requests.get(pdf_url, headers=HEADERS)
+        if 'application/pdf' not in r.headers.get('Content-Type', ''):
             return None
-        with open("temp_sds.pdf", "wb") as f:
-            f.write(response.content)
-        doc = fitz.open("temp_sds.pdf")
+        with open("temp.pdf", "wb") as f:
+            f.write(r.content)
+        doc = fitz.open("temp.pdf")
         text = "\n".join(page.get_text() for page in doc)
-        os.remove("temp_sds.pdf")
+        os.remove("temp.pdf")
+        hazard_codes = list(set(re.findall(r"H[2-4]\d{2}", text)))
+        disposal_match = re.search(r"(Section\s*13.*?)(Section\s*\d+|$)", text, re.IGNORECASE | re.DOTALL)
+        disposal = disposal_match.group(1).strip() if disposal_match else "not found"
+        return {"hazards": hazard_codes or ["not found"], "disposal": disposal}
+    except Exception as e:
+        print(f"⚠️ PDF parse error: {e}")
+        return None
 
-        hazard_codes = re.findall(r"H[2-4]\d{2}", text)
-        disposal_match = re.search(r"(?i)section\s*13.*?(disposal[^:]*):(.*?)(?=\n\s*\d{1,2}[^\d]|$)", text, re.DOTALL)
-        disposal_text = disposal_match.group(2).strip() if disposal_match else "not found"
+def extract_html_sds_data(url):
+    try:
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(separator="\n")
+        hazard_codes = list(set(re.findall(r"H[2-4]\d{2}", text)))
+        disposal_match = re.search(r"(Section\s*13.*?)(Section\s*\d+|$)", text, re.IGNORECASE | re.DOTALL)
+        disposal = disposal_match.group(1).strip() if disposal_match else "not found"
+        return {"hazards": hazard_codes or ["not found"], "disposal": disposal}
+    except Exception as e:
+        print(f"⚠️ HTML SDS parse error: {e}")
+        return None
 
+def scrape_metadata(product_name):
+    try:
+        url = f"https://www.amazon.co.uk/s?k={quote(product_name)}"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        desc = soup.select_one("h2 span")
+        img = soup.select_one("img.s-image")
         return {
-            "hazards": list(set(hazard_codes)) or ["not found"],
-            "disposal": disposal_text,
-            "sds_url": pdf_url,
-            "source": "google_pdf"
+            "description": desc.text.strip() if desc else "not found",
+            "image": img['src'] if img and img.has_attr('src') else "not found"
         }
     except:
-        return None
+        return {"description": "not found", "image": "not found"}
 
-def try_html_sds(product_name):
-    query = f"{product_name} SDS site:chemicalsafety.com"
-    search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-    resp = requests.get(search_url, headers=HEADERS)
-    if resp.status_code != 200:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        match = re.search(r"/url\?q=(https://www\.chemicalsafety\.com[^&]+)", a["href"])
-        if match:
-            page_url = match.group(1)
-            page = requests.get(page_url, headers=HEADERS)
-            if page.status_code != 200:
-                continue
-            page_soup = BeautifulSoup(page.text, "html.parser")
-            text = page_soup.get_text(separator="\n")
-            hazard_codes = re.findall(r"H[2-4]\d{2}", text)
-            disposal = "not found"
-            if "section 13" in text.lower():
-                disposal = "disposal guidance available on site"
-            return {
-                "hazards": list(set(hazard_codes)) or ["not found"],
-                "disposal": disposal,
-                "sds_url": page_url,
-                "source": "chemical_safety_html"
-            }
-    return None
-
-def save_to_firestore(product_name, data):
-    required = ["hazards", "disposal", "sds_url"]
-    missing = any(data.get(k) in [None, "not found"] for k in required)
-    product_doc = {
-        "name": product_name,
-        "hazards": data.get("hazards", ["not found"]),
-        "disposal": data.get("disposal", "not found"),
-        "sds_url": data.get("sds_url", ""),
-        "source": data.get("source", "unknown"),
-        "image": "not found",
-        "description": "not found",
-        "score": "not found",
+def save_to_firestore(name, hazards, disposal, sds_url, image, description, source):
+    missing = not all([hazards and hazards != ["not found"], disposal != "not found", image != "not found", description != "not found"])
+    doc = {
+        "name": name,
+        "hazards": hazards,
+        "disposal": disposal,
+        "sds_url": sds_url,
+        "source": source,
+        "image": image,
+        "description": description,
         "missingFields": missing
     }
-    products_ref.document(product_name.lower()).set(product_doc)
+    products_ref.document(name.lower()).set(doc)
 
 @app.route("/")
 def health():
-    return "EcoRank scraper is live."
+    return "✅ EcoRank fallback scraper is live."
 
 @app.route("/scrape", methods=["GET"])
 def scrape():
-    product_name = request.args.get("productName")
-    if not product_name:
+    name = request.args.get("productName")
+    if not name:
         return jsonify({"error": "Missing productName"}), 400
 
-    existing_doc = products_ref.document(product_name.lower()).get()
-    if existing_doc.exists:
-        return jsonify(existing_doc.to_dict())
+    cached = products_ref.document(name.lower()).get()
+    if cached.exists:
+        return jsonify(cached.to_dict())
 
-    pdf_url = search_google_for_sds(product_name)
-    if pdf_url:
-        data = extract_data_from_pdf(pdf_url)
-        if data:
-            save_to_firestore(product_name, data)
-            return jsonify(data)
-
-    html_data = try_html_sds(product_name)
-    if html_data:
-        save_to_firestore(product_name, html_data)
-        return jsonify(html_data)
+    links = fetch_google_results(name)
+    for link in links:
+        print(f"🔎 Trying: {link}")
+        if link.lower().endswith(".pdf"):
+            parsed = extract_pdf_data(link)
+        else:
+            parsed = extract_html_sds_data(link)
+        if parsed and parsed.get("hazards"):
+            meta = scrape_metadata(name)
+            save_to_firestore(name, parsed["hazards"], parsed["disposal"], link, meta["image"], meta["description"], link)
+            return jsonify({
+                "name": name,
+                "hazards": parsed["hazards"],
+                "disposal": parsed["disposal"],
+                "sds_url": link,
+                "image": meta["image"],
+                "description": meta["description"]
+            })
 
     return jsonify({"error": "No SDS found in Google results"}), 404
 
