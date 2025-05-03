@@ -1,19 +1,11 @@
-import os
-import re
-import requests
-import fitz  # PyMuPDF
-from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
-from firebase_admin import credentials, firestore, initialize_app
-from urllib.parse import quote
-
-app = Flask(__name__)
-
-# Firebase setup
 import firebase_admin
+from firebase_admin import credentials, firestore
+
+# Proper Firebase initialization
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 products_ref = db.collection('products')
 
