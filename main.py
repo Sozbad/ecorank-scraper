@@ -28,13 +28,13 @@ def search_google_sds(product_name):
 
     soup = BeautifulSoup(resp.text, "html.parser")
     for a in soup.find_all("a", href=True):
-        href = a['href']
-        match = re.search(r"/url\\?q=(https?[^&]+)", href)
+        href = a["href"]
+        match = re.search(r"/url\?q=(https?[^&]+)", href)
         if match:
             pdf_url = match.group(1)
             if pdf_url.lower().endswith(".pdf"):
                 head = requests.head(pdf_url, allow_redirects=True, headers=HEADERS)
-                if 'application/pdf' in head.headers.get('Content-Type', ''):
+                if "application/pdf" in head.headers.get("Content-Type", ""):
                     return pdf_url
     return None
 
@@ -49,10 +49,11 @@ def extract_hazard_data_from_pdf(pdf_url):
 
         doc = fitz.open("temp_sds.pdf")
         text = "\n".join(page.get_text() for page in doc)
+        doc.close()
         os.remove("temp_sds.pdf")
 
-        hazard_codes = re.findall(r"H[2-4]\\d{2}", text)
-        section_13 = re.search(r"(?<=13\\.?\\s*DISPOSAL(?:\\s+INFORMATION)?)(.*?)(?=\\n\\d+\\.|\\Z)", text, re.DOTALL | re.IGNORECASE)
+        hazard_codes = re.findall(r"H[2-4]\d{2}", text)
+        section_13 = re.search(r"13\.*\s*(Disposal.*?)(?:\n\d+\.|\Z)", text, re.IGNORECASE | re.DOTALL)
         disposal_text = section_13.group(1).strip() if section_13 else "not found"
 
         return {
@@ -64,15 +65,35 @@ def extract_hazard_data_from_pdf(pdf_url):
     except Exception as e:
         return None
 
+def scrape_description_and_image(product_name):
+    sources = [
+        f"https://www.amazon.co.uk/s?k={requests.utils.quote(product_name)}",
+        f"https://www.screwfix.com/search?search={requests.utils.quote(product_name)}"
+    ]
+    for url in sources:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            img = soup.find("img")
+            desc = soup.find("meta", {"name": "description"})
+            image_url = img["src"] if img and "src" in img.attrs else "not found"
+            description = desc["content"] if desc and "content" in desc.attrs else "not found"
+            if image_url != "not found" or description != "not found":
+                return image_url, description
+        except:
+            continue
+    return "not found", "not found"
+
 def save_to_firestore(product_name, data):
+    image, description = scrape_description_and_image(product_name)
     product_doc = {
         "name": product_name,
         "hazards": data.get("hazards", ["not found"]),
         "disposal": data.get("disposal", "not found"),
         "sds_url": data.get("sds_url", ""),
         "source": data.get("source", "google_sds_scraper"),
-        "image": "not found",
-        "description": "not found",
+        "image": image,
+        "description": description,
         "score": "not found"
     }
     products_ref.document(product_name.lower()).set(product_doc)
@@ -87,12 +108,10 @@ def scrape():
     if not product_name:
         return jsonify({"error": "Missing productName"}), 400
 
-    # Check Firestore first
     existing_doc = products_ref.document(product_name.lower()).get()
     if existing_doc.exists:
         return jsonify(existing_doc.to_dict())
 
-    # Try Google SDS scrape
     pdf_url = search_google_sds(product_name)
     if not pdf_url:
         return jsonify({"error": "SDS not found via Google"}), 404
