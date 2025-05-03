@@ -1,36 +1,39 @@
 import requests
 from bs4 import BeautifulSoup
-from sds_parser import parse_sds_pdf
 
 def scrape_product(product_name):
     try:
-        # Google-style PDF search (simple fallback logic)
-        query = f"{product_name} SDS filetype:pdf"
-        google_search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-        resp = requests.get(google_search_url, headers=headers)
-        soup = BeautifulSoup(resp.text, "html.parser")
+        query = f"{product_name} SDS site:chemicalsafety.com"
+        url = f"https://www.google.com/search?q={query}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers)
+
+        soup = BeautifulSoup(res.text, "html.parser")
         links = soup.select("a")
-
+        sds_url = None
         for link in links:
-            href = link.get("href")
-            if href and "pdf" in href and "http" in href:
-                pdf_url = href.split("q=")[-1].split("&")[0]
-                print(f"🔗 Found SDS PDF: {pdf_url}")
-                pdf_resp = requests.get(pdf_url)
-                with open("/tmp/temp.pdf", "wb") as f:
-                    f.write(pdf_resp.content)
+            href = link.get("href", "")
+            if "chemicalsafety.com/sds/" in href:
+                sds_url = href.split("&")[0].replace("/url?q=", "")
+                break
 
-                text = parse_sds_pdf("/tmp/temp.pdf")
-                return {
-                    "productName": product_name,
-                    "sds_text_snippet": text[:1000],
-                    "sds_url": pdf_url
-                }
+        if not sds_url:
+            return {"error": "No SDS found"}
 
-        return {"error": "No SDS PDF found"}
+        sds_res = requests.get(sds_url, headers=headers)
+        sds_soup = BeautifulSoup(sds_res.text, "html.parser")
+
+        title_tag = sds_soup.find("h1")
+        title = title_tag.text.strip() if title_tag else "Untitled"
+
+        h_section = sds_soup.find("section", class_="hazards")
+        hazards = h_section.get_text(strip=True) if h_section else "Hazard info not found"
+
+        return {
+            "product": product_name,
+            "title": title,
+            "hazards": hazards,
+            "source": sds_url
+        }
     except Exception as e:
         return {"error": str(e)}
