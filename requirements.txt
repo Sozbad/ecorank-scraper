@@ -1,4 +1,4 @@
-requests
-firebase-admin
-beautifulsoup4
-PyMuPDF
+Flask==2.3.2
+requests==2.31.0
+beautifulsoup4==4.12.2
+PyMuPDF==1.23.6
