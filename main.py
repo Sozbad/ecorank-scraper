@@ -1,50 +1,27 @@
 from flask import Flask, request, jsonify
-import os
 from scraper import scrape_product
-from google_sds_fallback import search_google_sds_fallback
+import os
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def root():
-    return "EcoRank scraper is live."
+    return "EcoRank scraper is running."
 
-@app.route("/scrape", methods=["POST"])
-def scrape():
-    data = request.get_json()
-    if not data or "product_name" not in data:
-        return jsonify({"error": "Missing product_name"}), 400
+@app.route("/scrape", methods=["GET"])
+def scrape_route():
+    product_name = request.args.get("productName", "").strip()
+    print(f"🔍 Received scrape request for: {product_name}")
+    if not product_name:
+        return jsonify({"error": "Missing productName"}), 400
 
-    product_name = data["product_name"]
-    print(f"Received scrape request for: {product_name}")
-
-    # Primary scrape
-    print("Trying primary sources...")
-    sds_data = try_primary_sources(product_name)
-    if sds_data:
-        print("Primary source SUCCESS")
-        saveProductToFirestore(sds_data)
-        return jsonify(sds_data)
-
-    print("Primary source FAILED — trying Google SDS fallback")
-    fallback = search_google_sds_fallback(product_name)
-    if fallback and fallback.get("hazards"):
-        print("Google fallback SUCCESS")
-        saveProductToFirestore(fallback)
-        return jsonify(fallback)
-
-    print("Google fallback FAILED — returning minimal result")
-    incomplete = {
-        "name": product_name,
-        "hazards": "not found",
-        "disposal": "not found",
-        "sds_url": None,
-        "source": "Google fallback failed",
-        "score": 0,
-        "incomplete": True
-    }
-    saveProductToFirestore(incomplete)
-    return jsonify(incomplete)
+    try:
+        result = scrape_product(product_name)
+        print(f"✅ Scrape result: {result}")
+        return jsonify(result), 200 if "error" not in result else 404
+    except Exception as e:
+        print(f"❌ Internal server error: {e}")
+        return jsonify({"error": "Internal error"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
