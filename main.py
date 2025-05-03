@@ -1,11 +1,5 @@
 from flask import Flask, request, jsonify
-
-# ✅ Try importing scraper with error capture
-try:
-    from scraper import scrape_product
-    print("✅ Successfully imported scraper module.")
-except Exception as e:
-    print(f"🚨 Failed to import scraper: {e}")
+from scraper import scrape_product
 
 app = Flask(__name__)
 
@@ -28,9 +22,7 @@ def scrape_route():
         print(f"❌ Internal server error: {e}")
         return jsonify({"error": "Internal error"}), 500
 
-# ✅ Required for Cloud Run
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 8080))  # Use 8080 if available
-    print(f"🚀 Starting EcoRank Flask server on port {port}...")
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
