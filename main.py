@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
-from scraper import scrape_product
+from scraper import try_primary_sources, saveProductToFirestore
+from google_sds_fallback import search_google_sds_fallback
 
 app = Flask(__name__)
 
@@ -15,8 +16,35 @@ def scrape():
         return jsonify({"error": "Missing product_name"}), 400
 
     product_name = data["product_name"]
-    result = scrape_product(product_name)
-    return jsonify(result)
+    print(f"Received scrape request for: {product_name}")
+
+    # Primary scrape
+    print("Trying primary sources...")
+    sds_data = try_primary_sources(product_name)
+    if sds_data:
+        print("Primary source SUCCESS")
+        saveProductToFirestore(sds_data)
+        return jsonify(sds_data)
+
+    print("Primary source FAILED — trying Google SDS fallback")
+    fallback = search_google_sds_fallback(product_name)
+    if fallback and fallback.get("hazards"):
+        print("Google fallback SUCCESS")
+        saveProductToFirestore(fallback)
+        return jsonify(fallback)
+
+    print("Google fallback FAILED — returning minimal result")
+    incomplete = {
+        "name": product_name,
+        "hazards": "not found",
+        "disposal": "not found",
+        "sds_url": None,
+        "source": "Google fallback failed",
+        "score": 0,
+        "incomplete": True
+    }
+    saveProductToFirestore(incomplete)
+    return jsonify(incomplete)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
