@@ -1,53 +1,56 @@
-from pathlib import Path
-
-# Define the updated google_sds_fallback.py with logic to handle empty hazard codes
-updated_google_sds_fallback = """
 import requests
-import fitz  # PyMuPDF
+from bs4 import BeautifulSoup
 import re
+from urllib.parse import quote
+from PyPDF2 import PdfReader
 from io import BytesIO
+import time
 
-def extract_from_pdf(pdf_url):
+def extract_hazard_codes(text):
+    return list(set(re.findall(r'H[2-4]\d{2}', text)))
+
+def extract_disposal_section(text):
+    match = re.search(r'(?:Section\s*13[\.:]?\s*)(.*?)((?:Section\s*\d{1,2}[\.:])|$)', text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else "not found"
+
+def extract_text_from_pdf(url):
     try:
-        response = requests.get(pdf_url, timeout=15)
-        response.raise_for_status()
+        response = requests.get(url, timeout=15)
+        if response.ok:
+            reader = PdfReader(BytesIO(response.content))
+            return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+    except:
+        pass
+    return ""
 
-        with BytesIO(response.content) as data:
-            doc = fitz.open(stream=data, filetype="pdf")
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text()
+def search_google_sds_fallback(product_name):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    query = f"{product_name} SDS filetype:pdf"
 
-            hazard_codes = re.findall(r'\\bH[2-4]\\d{2}\\b', full_text)
-            hazard_codes = list(set(hazard_codes))
+    for page in range(0, 2):  # Pages 1 and 2
+        start = page * 10
+        url = f"https://www.google.com/search?q={quote(query)}&start={start}"
+        res = requests.get(url, headers=headers)
+        soup = BeautifulSoup(res.text, "html.parser")
+        links = [a["href"] for a in soup.find_all("a", href=True) if a["href"].endswith(".pdf")]
 
-            # Try to extract disposal section (Section 13)
-            disposal = ""
-            section_13_match = re.search(r'(Section\\s*13[:\\-]? Disposal Considerations.*?)Section\\s*14', full_text, re.DOTALL | re.IGNORECASE)
-            if section_13_match:
-                disposal = section_13_match.group(1).strip()
+        for pdf_url in links:
+            text = extract_text_from_pdf(pdf_url)
+            if not text:
+                continue
+
+            hazard_codes = extract_hazard_codes(text)
+            disposal = extract_disposal_section(text)
 
             return {
-                "hazard_codes": hazard_codes,
-                "disposal": disposal or "not found",
-                "data_quality": "high" if hazard_codes else "low",
-                "score": 0 if not hazard_codes else None,
-                "recommended": False if not hazard_codes else None
+                "name": product_name,
+                "hazards": hazard_codes if hazard_codes else "not found",
+                "disposal": disposal,
+                "sds_url": pdf_url,
+                "source": "Google SDS fallback",
+                "score": 0
             }
 
-    except Exception as e:
-        print(f"PDF parse error: {e}")
-        return {
-            "hazard_codes": [],
-            "disposal": "not found",
-            "data_quality": "error",
-            "score": 0,
-            "recommended": False
-        }
-"""
+        time.sleep(1)
 
-# Save to file
-parser_path = Path("/mnt/data/google_sds_fallback.py")
-parser_path.write_text(updated_google_sds_fallback)
-
-parser_path.name
+    return None
