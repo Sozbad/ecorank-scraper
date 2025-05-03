@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import os
-from scraper import try_primary_sources, saveProductToFirestore
+from scraper import scrape_product
 from google_sds_fallback import search_google_sds_fallback
 
 app = Flask(__name__)
