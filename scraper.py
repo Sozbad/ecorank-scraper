@@ -1,59 +1,99 @@
-import os
+import re
 import requests
-from flask import Flask, request, jsonify
-from firebase_admin import credentials, firestore, initialize_app
-from google_sds_fallback import scrape_google_fallback
-from utils.image_and_description import fetch_image_and_description  # custom util for description/image fallback
+from bs4 import BeautifulSoup
+from firebase_admin import firestore
 
-# Firebase setup
-import firebase_admin
-if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault()
-    initialize_app(cred)
+from utils.google_sds_fallback import search_google_for_sds_pdf, extract_sds_data_from_pdf
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
+}
+
 db = firestore.client()
 products_ref = db.collection("products")
 
-app = Flask(__name__)
 
-@app.route("/")
-def health():
-    return "EcoRank scraper is live."
+def scrape_amazon(product_name):
+    try:
+        url = f"https://www.amazon.co.uk/s?k={requests.utils.quote(product_name)}"
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-@app.route("/scrape", methods=["GET"])
-def scrape():
-    product_name = request.args.get("productName")
-    if not product_name:
-        return jsonify({"error": "Missing productName"}), 400
+        product = soup.select_one(".s-result-item h2 a")
+        if not product:
+            return {}
 
-    doc_id = product_name.strip().lower()
-    existing = products_ref.document(doc_id).get()
-    if existing.exists:
-        return jsonify(existing.to_dict())
+        product_url = "https://www.amazon.co.uk" + product["href"]
+        product_res = requests.get(product_url, headers=HEADERS, timeout=10)
+        detail_soup = BeautifulSoup(product_res.text, "html.parser")
 
-    print(f"🧠 Scraping fallback for: {product_name}")
+        title = detail_soup.select_one("#productTitle")
+        img = detail_soup.select_one("#imgTagWrapperId img")
 
-    # 1. SDS fallback
-    sds_data = scrape_google_fallback(product_name)
-    if not sds_data:
-        return jsonify({"error": "No SDS PDF found in Google results"}), 404
+        return {
+            "description": title.text.strip() if title else "not found",
+            "image": img["src"] if img else "not found"
+        }
+    except Exception:
+        return {}
 
-    # 2. Image + description fallback
-    desc_data = fetch_image_and_description(product_name)
 
-    final_doc = {
+def scrape_screwfix(product_name):
+    try:
+        url = f"https://www.screwfix.com/search?search={requests.utils.quote(product_name)}"
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        product = soup.select_one(".productDesc a")
+        if not product:
+            return {}
+
+        product_url = "https://www.screwfix.com" + product["href"]
+        product_res = requests.get(product_url, headers=HEADERS, timeout=10)
+        detail_soup = BeautifulSoup(product_res.text, "html.parser")
+
+        title = detail_soup.select_one("h1")
+        img = detail_soup.select_one(".js-imgZoom")
+
+        return {
+            "description": title.text.strip() if title else "not found",
+            "image": img["src"] if img else "not found"
+        }
+    except Exception:
+        return {}
+
+
+def get_product_data(product_name):
+    product_doc = {
         "name": product_name,
-        "hazards": sds_data.get("hazards", ["not found"]),
-        "disposal": sds_data.get("disposal", "not found"),
-        "sds_url": sds_data.get("sds_url", ""),
-        "source": sds_data.get("source", "google_sds_fallback"),
+        "hazards": ["not found"],
+        "disposal": "not found",
+        "description": "not found",
+        "image": "not found",
         "score": "not found",
-        "image": desc_data.get("image", "not found"),
-        "description": desc_data.get("description", "not found"),
-        "data_quality": sds_data.get("data_quality", "partial")
+        "sds_url": "",
+        "source": ""
     }
 
-    products_ref.document(doc_id).set(final_doc)
-    return jsonify(final_doc)
+    # Step 1: Google SDS fallback
+    pdf_url = search_google_for_sds_pdf(product_name)
+    if pdf_url:
+        sds_data = extract_sds_data_from_pdf(pdf_url)
+        if sds_data:
+            product_doc.update(sds_data)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Step 2: Try Screwfix
+    screwfix_data = scrape_screwfix(product_name)
+    for k in ["image", "description"]:
+        if screwfix_data.get(k) and product_doc[k] == "not found":
+            product_doc[k] = screwfix_data[k]
+
+    # Step 3: Try Amazon
+    amazon_data = scrape_amazon(product_name)
+    for k in ["image", "description"]:
+        if amazon_data.get(k) and product_doc[k] == "not found":
+            product_doc[k] = amazon_data[k]
+
+    # Final save
+    products_ref.document(product_name.lower()).set(product_doc)
+    return product_doc
