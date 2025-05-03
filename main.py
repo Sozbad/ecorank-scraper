@@ -1,28 +1,26 @@
-from flask import Flask, request, jsonify
-from scraper import scrape_product
+from scraper import try_primary_sources, saveProductToFirestore
+from google_sds_fallback import search_google_sds_fallback
 
-app = Flask(__name__)
+def enrich_product(product_name):
+    # First try main sources
+    sds_data = try_primary_sources(product_name)
 
-@app.route("/")
-def root():
-    return "EcoRank scraper is running."
+    if sds_data:
+        return saveProductToFirestore(sds_data)
 
-@app.route("/scrape", methods=["GET"])
-def scrape_route():
-    product_name = request.args.get("productName", "").strip()
-    print(f"🔍 Received scrape request for: {product_name}")
-    if not product_name:
-        return jsonify({"error": "Missing productName"}), 400
+    # Fallback to Google SDS search
+    fallback_data = search_google_sds_fallback(product_name)
 
-    try:
-        result = scrape_product(product_name)
-        print(f"✅ Scrape result: {result}")
-        return jsonify(result), 200 if "error" not in result else 404
-    except Exception as e:
-        print(f"❌ Internal server error: {e}")
-        return jsonify({"error": "Internal error"}), 500
+    if fallback_data and fallback_data.get("hazards"):
+        return saveProductToFirestore(fallback_data)
 
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # Still nothing – mark as incomplete
+    return saveProductToFirestore({
+        "name": product_name,
+        "hazards": "not found",
+        "disposal": "not found",
+        "sds_url": None,
+        "source": "Google fallback failed",
+        "score": 0,
+        "incomplete": True
+    })
