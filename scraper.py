@@ -1,61 +1,68 @@
 import requests
 from bs4 import BeautifulSoup
-from firebase_admin import credentials, firestore, initialize_app
-from sds_parser import parse_sds_pdf
-import datetime
-import os
+import re
+import json
+from urllib.parse import quote
+from firebase_utils import saveProductToFirestore
 
-# Firestore init
-if not firestore._apps:
-    cred = credentials.ApplicationDefault()
-    initialize_app(cred)
-db = firestore.client()
+def scrape_chemical_safety(product_name):
+    search_url = f"https://www.chemicalsafety.com/sds-search?q={quote(product_name)}"
+    search_response = requests.get(search_url, timeout=10)
+    if search_response.status_code != 200:
+        return None
 
-def scrape_product(product_name):
-    query = f"{product_name} SDS filetype:pdf"
-    url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    soup = BeautifulSoup(search_response.text, "html.parser")
+    product_links = soup.select(".sdsResultItem a")
+    if not product_links:
+        return None
 
-    try:
-        res = requests.get(url, headers=headers)
-        soup = BeautifulSoup(res.text, "html.parser")
-        for a in soup.select("a"):
-            href = a.get("href")
-            if href and "pdf" in href and "http" in href:
-                pdf_url = href.split("q=")[-1].split("&")[0]
-                print(f"🔗 Found SDS PDF: {pdf_url}")
-                pdf_bytes = requests.get(pdf_url).content
-                with open("/tmp/temp.pdf", "wb") as f:
-                    f.write(pdf_bytes)
-                sds_text = parse_sds_pdf("/tmp/temp.pdf") or ""
+    product_url = product_links[0]["href"]
+    if not product_url.startswith("http"):
+        product_url = "https://www.chemicalsafety.com" + product_url
 
-                product_data = {
-                    "name": product_name,
-                    "description": "SDS fallback scrape",
-                    "image": "",
-                    "sds_url": pdf_url,
-                    "hazards": [],
-                    "hazard_codes": [],
-                    "health": 0,
-                    "environment": 0,
-                    "disposal": 0,
-                    "score": 10,
-                    "recommended": True,
-                    "primary_category": "Uncategorized",
-                    "subcategory": "Fallback",
-                    "categories": ["Uncategorized"],
-                    "barcode": "",
-                    "certifications": [],
-                    "last_scraped": datetime.datetime.utcnow().isoformat() + "Z",
-                    "source": "google-fallback"
-                }
+    sds_response = requests.get(product_url, timeout=10)
+    if sds_response.status_code != 200:
+        return None
 
-                doc_id = product_name.lower().replace(" ", "-")
-                db.collection("products").document(doc_id).set(product_data)
-                print("✅ Saved to Firestore:", doc_id)
-                return product_data
+    sds_soup = BeautifulSoup(sds_response.text, "html.parser")
 
-        return {"error": "No SDS PDF found"}
-    except Exception as e:
-        print(f"❌ Scraping failed: {e}")
-        return {"error": str(e)}
+    # Extract product name
+    name_elem = sds_soup.select_one("h1")
+    product_name = name_elem.text.strip() if name_elem else product_name
+
+    # Extract hazard codes
+    hazards_section = sds_soup.find("h2", string=re.compile("Hazards Identification", re.IGNORECASE))
+    h_codes = []
+    if hazards_section:
+        ul = hazards_section.find_next("ul")
+        if ul:
+            for li in ul.find_all("li"):
+                matches = re.findall(r"(H\d{3})", li.text)
+                h_codes.extend(matches)
+
+    # Extract SDS URL
+    pdf_link = sds_soup.find("a", href=re.compile(r"\.pdf"))
+    sds_pdf_url = pdf_link["href"] if pdf_link else product_url
+
+    # Build final product object
+    product = {
+        "name": product_name,
+        "slug": product_name.lower().replace(" ", "-"),
+        "source": product_url,
+        "sds_url": sds_pdf_url,
+        "hazards": h_codes or ["not found"],
+        "image": False,
+        "description": "not found",
+        "score": 0,
+        "score_raw": 0,
+        "score_breakdown": {
+            "health": 0,
+            "environment": 0,
+            "handling_disposal": 0
+        },
+        "disposal": "not found",
+        "affiliate": False
+    }
+
+    saveProductToFirestore(product)
+    return product
