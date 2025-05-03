@@ -1,59 +1,59 @@
-import firebase_admin
-from firebase_admin import credentials, firestore
-import datetime
-from sds_parser import parse_sds_pdf
-from google_sds_fallback import google_sds_fallback
+import os
+import requests
+from flask import Flask, request, jsonify
+from firebase_admin import credentials, firestore, initialize_app
+from google_sds_fallback import scrape_google_fallback
+from utils.image_and_description import fetch_image_and_description  # custom util for description/image fallback
 
+# Firebase setup
+import firebase_admin
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred)
+    initialize_app(cred)
 db = firestore.client()
+products_ref = db.collection("products")
 
-def assign_disposal(h_codes):
-    if not h_codes:
-        return "not found"
-    if any(code.startswith("H2") for code in h_codes):
-        return "Do not dispose in household waste. Take to a hazardous waste collection site."
-    elif any(code.startswith("H3") for code in h_codes):
-        return "Use PPE and dispose through a licensed provider."
-    elif any(code.startswith("H4") for code in h_codes):
-        return "Hazardous to environment. Never pour into drains."
-    return "Dispose of according to local regulations."
+app = Flask(__name__)
 
-def check_firestore_cache(product_name):
-    docs = db.collection("products").where("name", "==", product_name).stream()
-    for doc in docs:
-        return doc.to_dict()
-    return None
+@app.route("/")
+def health():
+    return "EcoRank scraper is live."
 
-def save_to_firestore(product):
-    try:
-        slug = product["name"].lower().replace(" ", "-")
-        product["slug"] = slug
-        product["timestamp"] = datetime.datetime.utcnow().isoformat()
-        db.collection("products").document(slug).set(product)
-        print(f"✅ Saved product to Firestore: {slug}")
-    except Exception as e:
-        print(f"❌ Firestore save failed: {e}")
+@app.route("/scrape", methods=["GET"])
+def scrape():
+    product_name = request.args.get("productName")
+    if not product_name:
+        return jsonify({"error": "Missing productName"}), 400
 
-def scrape_product(product_name):
-    product_name = product_name.strip()
-    print(f"🔍 Scraping for: {product_name}")
+    doc_id = product_name.strip().lower()
+    existing = products_ref.document(doc_id).get()
+    if existing.exists:
+        return jsonify(existing.to_dict())
 
-    cached = check_firestore_cache(product_name)
-    if cached:
-        print("⚡ Found in Firestore cache")
-        return cached
+    print(f"🧠 Scraping fallback for: {product_name}")
 
-    print("🌐 Trying Google SDS fallback...")
-    fallback = google_sds_fallback(product_name)
+    # 1. SDS fallback
+    sds_data = scrape_google_fallback(product_name)
+    if not sds_data:
+        return jsonify({"error": "No SDS PDF found in Google results"}), 404
 
-    if fallback:
-        h_codes = fallback.get("hazard_codes", [])
-        fallback["disposal"] = assign_disposal(h_codes)
-        fallback["name"] = product_name
-        save_to_firestore(fallback)
-        return fallback
+    # 2. Image + description fallback
+    desc_data = fetch_image_and_description(product_name)
 
-    print("❌ No SDS found for this product.")
-    return {"error": "No SDS found"}
+    final_doc = {
+        "name": product_name,
+        "hazards": sds_data.get("hazards", ["not found"]),
+        "disposal": sds_data.get("disposal", "not found"),
+        "sds_url": sds_data.get("sds_url", ""),
+        "source": sds_data.get("source", "google_sds_fallback"),
+        "score": "not found",
+        "image": desc_data.get("image", "not found"),
+        "description": desc_data.get("description", "not found"),
+        "data_quality": sds_data.get("data_quality", "partial")
+    }
+
+    products_ref.document(doc_id).set(final_doc)
+    return jsonify(final_doc)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
