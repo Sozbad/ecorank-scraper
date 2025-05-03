@@ -1,68 +1,59 @@
-import requests
-from bs4 import BeautifulSoup
-import re
-import json
-from urllib.parse import quote
-from firebase_utils import saveProductToFirestore
+import firebase_admin
+from firebase_admin import credentials, firestore
+import datetime
+from sds_parser import parse_sds_pdf
+from google_sds_fallback import google_sds_fallback
 
-def scrape_chemical_safety(product_name):
-    search_url = f"https://www.chemicalsafety.com/sds-search?q={quote(product_name)}"
-    search_response = requests.get(search_url, timeout=10)
-    if search_response.status_code != 200:
-        return None
+if not firebase_admin._apps:
+    cred = credentials.ApplicationDefault()
+    firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-    soup = BeautifulSoup(search_response.text, "html.parser")
-    product_links = soup.select(".sdsResultItem a")
-    if not product_links:
-        return None
+def assign_disposal(h_codes):
+    if not h_codes:
+        return "not found"
+    if any(code.startswith("H2") for code in h_codes):
+        return "Do not dispose in household waste. Take to a hazardous waste collection site."
+    elif any(code.startswith("H3") for code in h_codes):
+        return "Use PPE and dispose through a licensed provider."
+    elif any(code.startswith("H4") for code in h_codes):
+        return "Hazardous to environment. Never pour into drains."
+    return "Dispose of according to local regulations."
 
-    product_url = product_links[0]["href"]
-    if not product_url.startswith("http"):
-        product_url = "https://www.chemicalsafety.com" + product_url
+def check_firestore_cache(product_name):
+    docs = db.collection("products").where("name", "==", product_name).stream()
+    for doc in docs:
+        return doc.to_dict()
+    return None
 
-    sds_response = requests.get(product_url, timeout=10)
-    if sds_response.status_code != 200:
-        return None
+def save_to_firestore(product):
+    try:
+        slug = product["name"].lower().replace(" ", "-")
+        product["slug"] = slug
+        product["timestamp"] = datetime.datetime.utcnow().isoformat()
+        db.collection("products").document(slug).set(product)
+        print(f"✅ Saved product to Firestore: {slug}")
+    except Exception as e:
+        print(f"❌ Firestore save failed: {e}")
 
-    sds_soup = BeautifulSoup(sds_response.text, "html.parser")
+def scrape_product(product_name):
+    product_name = product_name.strip()
+    print(f"🔍 Scraping for: {product_name}")
 
-    # Extract product name
-    name_elem = sds_soup.select_one("h1")
-    product_name = name_elem.text.strip() if name_elem else product_name
+    cached = check_firestore_cache(product_name)
+    if cached:
+        print("⚡ Found in Firestore cache")
+        return cached
 
-    # Extract hazard codes
-    hazards_section = sds_soup.find("h2", string=re.compile("Hazards Identification", re.IGNORECASE))
-    h_codes = []
-    if hazards_section:
-        ul = hazards_section.find_next("ul")
-        if ul:
-            for li in ul.find_all("li"):
-                matches = re.findall(r"(H\d{3})", li.text)
-                h_codes.extend(matches)
+    print("🌐 Trying Google SDS fallback...")
+    fallback = google_sds_fallback(product_name)
 
-    # Extract SDS URL
-    pdf_link = sds_soup.find("a", href=re.compile(r"\.pdf"))
-    sds_pdf_url = pdf_link["href"] if pdf_link else product_url
+    if fallback:
+        h_codes = fallback.get("hazard_codes", [])
+        fallback["disposal"] = assign_disposal(h_codes)
+        fallback["name"] = product_name
+        save_to_firestore(fallback)
+        return fallback
 
-    # Build final product object
-    product = {
-        "name": product_name,
-        "slug": product_name.lower().replace(" ", "-"),
-        "source": product_url,
-        "sds_url": sds_pdf_url,
-        "hazards": h_codes or ["not found"],
-        "image": False,
-        "description": "not found",
-        "score": 0,
-        "score_raw": 0,
-        "score_breakdown": {
-            "health": 0,
-            "environment": 0,
-            "handling_disposal": 0
-        },
-        "disposal": "not found",
-        "affiliate": False
-    }
-
-    saveProductToFirestore(product)
-    return product
+    print("❌ No SDS found for this product.")
+    return {"error": "No SDS found"}
