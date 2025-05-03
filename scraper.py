@@ -1,57 +1,99 @@
 import requests
 from bs4 import BeautifulSoup
+import firebase_admin
+from firebase_admin import credentials, firestore
+import datetime
 import re
-from urllib.parse import quote
+from sds_parser import parse_sds_pdf
+from google_sds_fallback import google_sds_fallback
 
-def scrape_chemical_safety(product_name):
-    try:
-        query = quote(product_name)
-        url = f"https://www.chemicalsafety.com/sds-search/?q={query}"
-        response = requests.get(url, timeout=10)
-        soup = BeautifulSoup(response.text, "html.parser")
-        result_link = soup.select_one("div.search-results a")
-        if result_link:
-            href = result_link.get("href")
-            return {"source": "Chemical Safety", "sds_url": href}
-    except Exception as e:
-        print(f"❌ Chemical Safety error: {e}")
+if not firebase_admin._apps:
+    cred = credentials.ApplicationDefault()
+    firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+def assign_disposal(h_codes):
+    if not h_codes:
+        return "not found"
+    if any(code.startswith("H2") for code in h_codes):
+        return "Do not dispose in household waste. Take to a hazardous waste collection site."
+    elif any(code.startswith("H3") for code in h_codes):
+        return "Use PPE and dispose through a licensed provider."
+    elif any(code.startswith("H4") for code in h_codes):
+        return "Hazardous to environment. Never pour into drains."
+    return "Dispose of according to local regulations."
+
+def check_firestore_cache(product_name):
+    docs = db.collection("products").where("name", "==", product_name).stream()
+    for doc in docs:
+        print(f"📦 Cache hit for '{product_name}'")
+        return doc.to_dict()
     return None
 
-def scrape_screwfix(product_name):
+def save_to_firestore(product):
+    db.collection("products").add(product)
+    print(f"✅ Saved to Firestore: {product['name']}")
+
+def build_product(product_name, meta, fallback_data=None):
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    hazards = fallback_data["hazard_codes"] if fallback_data else []
+    disposal = fallback_data["disposal"] if fallback_data else "not found"
+    score = max(0, 10 - len(hazards)) if hazards else 0
+    recommended = score >= 7 and bool(hazards)
+
+    return {
+        "name": product_name,
+        "description": meta.get("description", "not found"),
+        "image": meta.get("image", "not found"),
+        "hazards": [],
+        "hazard_codes": hazards,
+        "score": score,
+        "recommended": recommended,
+        "barcode": "not found",
+        "categories": [],
+        "primary_category": "not found",
+        "subcategory": "not found",
+        "certifications": [],
+        "health": None,
+        "environment": None,
+        "disposal": disposal,
+        "sds_url": fallback_data["sds_url"] if fallback_data else "not found",
+        "source": fallback_data["source"] if fallback_data else "unknown",
+        "data_quality": fallback_data["data_quality"] if fallback_data else "unknown",
+        "last_scraped": now,
+        "disclaimer": "SDS data is parsed from public sources. Accuracy is not guaranteed."
+    }
+
+def get_fallback_meta(product_name):
     try:
-        search_url = f"https://www.screwfix.com/search?search={quote(product_name)}"
-        res = requests.get(search_url, timeout=10)
+        url = f"https://www.amazon.co.uk/s?k={product_name.replace(' ', '+')}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        link = soup.select_one(".productDesc a")
-        if link:
-            return {"source": "Screwfix", "product_url": "https://www.screwfix.com" + link.get("href")}
-    except Exception as e:
-        print(f"❌ Screwfix error: {e}")
-    return None
-
-def scrape_google_sds(product_name):
-    try:
-        query = quote(f"{product_name} SDS filetype:pdf")
-        google_url = f"https://www.google.com/search?q={query}"
-        headers = {
-            "User-Agent": "Mozilla/5.0"
+        first = soup.select_one("h2 span")
+        return {
+            "description": first.text.strip() if first else "not found",
+            "image": "not found"
         }
-        res = requests.get(google_url, headers=headers, timeout=10)
-        matches = re.findall(r"https://[^\s\"']+\.pdf", res.text)
-        if matches:
-            return {"source": "Google SDS", "sds_url": matches[0]}
     except Exception as e:
-        print(f"❌ Google SDS error: {e}")
-    return None
+        print(f"⚠️ Amazon fallback failed: {e}")
+        return {"description": "not found", "image": "not found"}
 
 def scrape_product(product_name):
-    print(f"🔍 Attempting to scrape SDS for: {product_name}")
+    print(f"🔍 Starting scrape for: {product_name}")
 
-    for scraper in [scrape_chemical_safety, scrape_screwfix, scrape_google_sds]:
-        result = scraper(product_name)
-        if result:
-            print(f"✅ Found SDS from {result['source']}")
-            return result
+    cached = check_firestore_cache(product_name)
+    if cached:
+        print("🟢 Using cached product")
+        return cached
 
-    print("❌ No SDS found after all fallbacks")
-    return {"error": "No SDS found"}
+    print("❌ Not found in cache — trying Google fallback")
+    sds_data = google_sds_fallback(product_name)
+    if not sds_data:
+        print("❌ Google fallback failed")
+        return {"error": "Product not found"}
+
+    meta = get_fallback_meta(product_name)
+    final = build_product(product_name, meta, sds_data)
+    save_to_firestore(final)
+    return final
