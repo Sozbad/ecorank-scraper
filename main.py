@@ -1,16 +1,18 @@
+
 import os
 import re
 import requests
 import fitz  # PyMuPDF
+import firebase_admin
 from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 from urllib.parse import quote
-import firebase_admin
 from firebase_admin import credentials, firestore
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
-# Firebase init
+# Firebase setup
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
@@ -21,110 +23,99 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-# Search Google for PDF or HTML SDS links
-def search_google_sds(product_name, max_pages=3):
-    for page in range(0, max_pages):
-        start = page * 10
-        query = f"{product_name} SDS filetype:pdf"
-        url = f"https://www.google.com/search?q={quote(query)}&start={start}"
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            match = re.search(r"/url\?q=(https?[^&]+)", href)
-            if match:
-                link = match.group(1)
-                # Accept PDF links
-                if link.lower().endswith(".pdf"):
-                    try:
-                        head = requests.head(link, headers=HEADERS, allow_redirects=True, timeout=5)
-                        if "application/pdf" in head.headers.get("Content-Type", ""):
-                            return {"type": "pdf", "url": link}
-                    except:
-                        continue
-                # Accept HTML viewer pages
-                elif any(domain in link for domain in ["chemicalsafety.com", "fisher.co.uk", "sigma-aldrich.com"]):
-                    return {"type": "html", "url": link}
+def run_playwright_google_search(query, max_pages=2):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        results = []
+        for i in range(max_pages):
+            start = i * 10
+            url = f"https://www.google.com/search?q={quote(query)}&start={start}"
+            page.goto(url)
+            page.wait_for_timeout(1000)
+            elements = page.query_selector_all("a")
+            for a in elements:
+                href = a.get_attribute("href")
+                if href and "/url?q=" in href:
+                    match = re.search(r"/url\?q=(https?[^&]+)", href)
+                    if match:
+                        results.append(match.group(1))
+        browser.close()
+        return results
+
+def search_sds_pdf_url(product_name):
+    links = run_playwright_google_search(f"{product_name} SDS filetype:pdf")
+    for url in links:
+        if url.lower().endswith(".pdf"):
+            try:
+                head = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=5)
+                if "application/pdf" in head.headers.get("Content-Type", ""):
+                    return url
+            except:
+                continue
     return None
 
-# Extract hazard data from PDF
-def extract_hazards_disposal_from_pdf(pdf_url):
+def extract_sds_text_from_pdf(pdf_url):
     try:
         res = requests.get(pdf_url, headers=HEADERS)
-        with open("temp.pdf", "wb") as f:
+        with open("temp_sds.pdf", "wb") as f:
             f.write(res.content)
-        doc = fitz.open("temp.pdf")
+        doc = fitz.open("temp_sds.pdf")
         text = "\n".join([page.get_text() for page in doc])
         doc.close()
-        os.remove("temp.pdf")
-
-        hazard_codes = list(set(re.findall(r"H[2-4]\d{2}", text)))
-        section_13 = re.search(r"(13\.*\s*DISPOSAL.*?)(?=\n\d+\.*|\Z)", text, re.DOTALL | re.IGNORECASE)
-        disposal_text = section_13.group(1).strip() if section_13 else "not found"
-
-        return {
-            "hazards": hazard_codes or ["not found"],
-            "disposal": disposal_text or "not found",
-        }
+        os.remove("temp_sds.pdf")
+        return text
     except:
-        return {
-            "hazards": ["not found"],
-            "disposal": "not found"
-        }
+        return ""
 
-# Fallback for image and description
+def parse_hazards_and_disposal(text):
+    hazard_codes = list(set(re.findall(r"H[2-4]\d{2}", text)))
+    section_13 = re.search(r"(13\.*\s*DISPOSAL.*?)(?=\n\d+\.|\Z)", text, re.DOTALL | re.IGNORECASE)
+    disposal = section_13.group(1).strip() if section_13 else "not found"
+    return hazard_codes or ["not found"], disposal or "not found"
+
 def search_google_details(product_name):
     try:
-        url = f"https://www.google.com/search?q={quote(product_name)}"
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        desc = ""
-        image = ""
-
-        for div in soup.find_all("div"):
-            if div.get("data-attrid") == "wa:/description":
-                desc = div.text.strip()
-                break
-        if not desc:
-            snippet = soup.find("div", class_="BNeawe s3v9rd AP7Wnd")
-            if snippet:
-                desc = snippet.text.strip()
-
-        img_tag = soup.find("img")
-        if img_tag and "src" in img_tag.attrs:
-            image = img_tag["src"]
-
-        return {
-            "description": desc or "not found",
-            "image": image or "not found"
-        }
+        results = run_playwright_google_search(product_name)
+        desc, image = "not found", "not found"
+        for link in results:
+            if "wikipedia.org" in link or "product" in link:
+                try:
+                    resp = requests.get(link, headers=HEADERS)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    p = soup.find("p")
+                    if p:
+                        desc = p.text.strip()
+                    img = soup.find("img")
+                    if img and img.get("src"):
+                        image = img["src"]
+                    break
+                except:
+                    continue
+        return { "description": desc, "image": image }
     except:
-        return {"description": "not found", "image": "not found"}
+        return { "description": "not found", "image": "not found" }
 
-# Save to Firestore
 def save_to_firestore(product_name, data):
     record = {
         "name": product_name,
         "hazards": data.get("hazards", ["not found"]),
         "disposal": data.get("disposal", "not found"),
         "sds_url": data.get("sds_url", ""),
-        "source": data.get("source", ""),
+        "source": data.get("source", "google_sds_scraper"),
         "image": data.get("image", "not found"),
         "description": data.get("description", "not found"),
         "score": "not found",
         "missingFields": []
     }
-
     for key in ["hazards", "disposal", "image", "description"]:
         if record[key] == "not found" or record[key] == ["not found"]:
             record["missingFields"].append(key)
-
     products_ref.document(product_name.lower()).set(record)
 
 @app.route("/")
-def health_check():
-    return "EcoRank scraper is running."
+def health():
+    return "EcoRank scraper running with Playwright."
 
 @app.route("/scrape", methods=["GET"])
 def scrape():
@@ -136,22 +127,21 @@ def scrape():
     if existing.exists:
         return jsonify(existing.to_dict())
 
-    result = search_google_sds(product_name)
+    pdf_url = search_sds_pdf_url(product_name)
+    if not pdf_url:
+        return jsonify({"error": "No SDS PDF found in Google results"}), 404
 
-    if not result:
-        return jsonify({"error": "No SDS found in Google results"}), 404
+    text = extract_sds_text_from_pdf(pdf_url)
+    if not text:
+        return jsonify({"error": "Failed to read PDF"}), 500
 
-    if result["type"] == "pdf":
-        data = extract_hazards_disposal_from_pdf(result["url"])
-        data["sds_url"] = result["url"]
-        data["source"] = "google_pdf_sds"
-    else:
-        data = {
-            "hazards": ["not found"],
-            "disposal": "not found",
-            "sds_url": result["url"],
-            "source": "google_html_sds"
-        }
+    hazards, disposal = parse_hazards_and_disposal(text)
+    data = {
+        "hazards": hazards,
+        "disposal": disposal,
+        "sds_url": pdf_url,
+        "source": "google_sds_scraper"
+    }
 
     details = search_google_details(product_name)
     data.update(details)
