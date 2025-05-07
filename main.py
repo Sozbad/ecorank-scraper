@@ -21,42 +21,34 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-# --- Primary SDS PDF search with multipage Google scrape
+# --- Search Google up to 3 pages for SDS PDFs
 def search_google_sds(product_name):
-    query = f"{product_name} SDS filetype:pdf"
-    for page in range(0, 3):  # Pages 0, 1, 2
-        start = page * 10
-        url = f"https://www.google.com/search?q={quote(query)}&start={start}"
+    for page in range(0, 30, 10):  # 0, 10, 20 (3 pages)
+        query = f"{product_name} SDS filetype:pdf"
+        url = f"https://www.google.com/search?q={quote(query)}&start={page}"
         try:
             r = requests.get(url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 match = re.search(r"/url\?q=(https?[^&]+)", href)
                 if match:
                     pdf_url = match.group(1)
-                    if ".pdf" in pdf_url.lower():
+                    if pdf_url.endswith(".pdf"):
                         try:
                             head = requests.head(pdf_url, headers=HEADERS, allow_redirects=True, timeout=5)
                             if "application/pdf" in head.headers.get("Content-Type", ""):
                                 return pdf_url
                         except:
-                            try:
-                                get = requests.get(pdf_url, headers=HEADERS, stream=True, timeout=10)
-                                if "application/pdf" in get.headers.get("Content-Type", ""):
-                                    return pdf_url
-                            except:
-                                continue
-        except Exception:
+                            continue
+        except:
             continue
     return None
 
-# --- SDS PDF extraction
+# --- PDF hazard extraction
 def extract_hazards_disposal_from_pdf(pdf_url):
     try:
-        res = requests.get(pdf_url, headers=HEADERS)
+        res = requests.get(pdf_url, headers=HEADERS, timeout=15)
         with open("temp.pdf", "wb") as f:
             f.write(res.content)
         doc = fitz.open("temp.pdf")
@@ -77,29 +69,28 @@ def extract_hazards_disposal_from_pdf(pdf_url):
     except:
         return None
 
-# --- Fallback HTML SDS viewer scrape
+# --- HTML SDS fallback
 def search_html_sds_page(product_name):
     query = f"{product_name} SDS site:chemicalsafety.com OR site:fisher.co.uk OR site:sigma-aldrich.com"
     url = f"https://www.google.com/search?q={quote(query)}"
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             match = re.search(r"/url\?q=(https?[^&]+)", href)
             if match:
                 page_url = match.group(1)
-                if "chemicalsafety.com" in page_url or "sds" in page_url.lower():
+                if "chemicalsafety" in page_url or "sds" in page_url.lower():
                     return page_url
     except:
         return None
-    return None
 
-# --- Google fallback for image + description
+# --- Google image + description fallback
 def search_google_details(product_name):
     url = f"https://www.google.com/search?q={quote(product_name)}"
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
         desc = ""
@@ -146,7 +137,7 @@ def save_to_firestore(product_name, data):
     products_ref.document(product_name.lower()).set(record)
 
 @app.route("/")
-def health_check():
+def health():
     return "EcoRank scraper is running."
 
 @app.route("/scrape", methods=["GET"])
@@ -161,12 +152,12 @@ def scrape():
 
     data = {}
 
-    # Try PDF
+    # Try PDF SDS
     pdf_url = search_google_sds(product_name)
     if pdf_url:
         data = extract_hazards_disposal_from_pdf(pdf_url)
 
-    # If PDF failed, try HTML fallback
+    # Fallback to HTML SDS viewer
     if not data:
         html_url = search_html_sds_page(product_name)
         if html_url:
@@ -177,11 +168,10 @@ def scrape():
                 "source": "google_html_sds_fallback"
             }
 
-    # If SDS completely failed
     if not data:
         return jsonify({"error": "No SDS found in Google results"}), 404
 
-    # Supplement image + description
+    # Add image + description
     details = search_google_details(product_name)
     data.update(details)
 
