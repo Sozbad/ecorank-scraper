@@ -1,14 +1,9 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
 
-# Install system dependencies for PyMuPDF
-RUN apt-get update && apt-get install -y libglib2.0-0 libgl1-mesa-glx
-
-# Install Python dependencies
-COPY requirements.txt requirements.txt
+WORKDIR /app
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
-COPY . /app
-WORKDIR /app
+COPY . .
 
 CMD ["python", "main.py"]
