@@ -1,19 +1,24 @@
-# firebase_utils.py
 import firebase_admin
 from firebase_admin import credentials, firestore
-import os
 
-# Prevent reinitialization during import
 if not firebase_admin._apps:
     cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
 def saveProductToFirestore(product):
-    try:
-        slug = product.get("slug", product.get("name", "unnamed-product")).replace(" ", "-").lower()
-        doc_ref = db.collection("products").document(slug)
-        doc_ref.set(product)
-        print(f"✅ Saved to Firestore: {slug}")
-    except Exception as e:
-        print("❌ Firestore save error:", e)
+    slug = product.get("name", "").lower().replace(" ", "-")
+    data = {
+        "name": product.get("name", "not found"),
+        "hazards": product.get("hazards", ["not found"]),
+        "disposal": product.get("disposal", "not found"),
+        "description": product.get("description", "not found"),
+        "image": product.get("image", "not found"),
+        "sds_url": product.get("sds_url", ""),
+        "source": product.get("source", "unknown"),
+        "score": product.get("score", "not found"),
+        "missingFields": product.get("missingFields", []),
+        "lastUpdated": firestore.SERVER_TIMESTAMP
+    }
+    db.collection("products").document(slug).set(data, merge=True)
