@@ -2,7 +2,7 @@ import os
 from flask import Flask, request, jsonify
 from utils.google_sds_fallback import search_google_for_sds_pdf, extract_sds_data_from_pdf
 from utils.image_and_description import fetch_image_and_description
-from utils.firebase_utils import saveProductToFirestore
+from firebase_utils import saveProductToFirestore
 
 app = Flask(__name__)
 
