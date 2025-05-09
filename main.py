@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request, jsonify
-from google_sds_fallback import search_google_for_sds_pdf, extract_sds_data_from_pdf
-from image_and_description import fetch_image_and_description
+from utils.google_sds_fallback import search_google_for_sds_pdf, extract_sds_data_from_pdf
+from utils.image_and_description import fetch_image_and_description
 from firebase_utils import saveProductToFirestore
 
 app = Flask(__name__)
@@ -21,6 +21,7 @@ def scrape():
     if not product_name:
         return jsonify({"error": "Missing product_name"}), 400
 
+    # Initialize default data structure
     product_data = {
         "name": product_name,
         "hazards": ["not found"],
@@ -33,6 +34,7 @@ def scrape():
         "missingFields": []
     }
 
+    # Try to get SDS PDF data
     try:
         pdf_url = search_google_for_sds_pdf(product_name)
         if pdf_url:
@@ -40,23 +42,26 @@ def scrape():
             if sds_data:
                 product_data.update(sds_data)
     except Exception as e:
-        print(f"⚠️ SDS scrape failed: {str(e)}")
+        print(f"⚠️ SDS scrape failed: {e}")
 
+    # Try to get visual and description
     try:
-        visual_data = fetch_image_and_description(product_name)
-        product_data.update(visual_data)
+        visuals = fetch_image_and_description(product_name)
+        product_data.update(visuals)
     except Exception as e:
-        print(f"⚠️ Visual scrape failed: {str(e)}")
+        print(f"⚠️ Image scrape failed: {e}")
 
-    for key in ["hazards", "disposal", "image", "description"]:
-        if product_data[key] == "not found" or product_data[key] == ["not found"]:
-            product_data["missingFields"].append(key)
+    # Track missing fields
+    for field in ["hazards", "disposal", "description", "image"]:
+        if product_data[field] == "not found" or product_data[field] == ["not found"]:
+            product_data["missingFields"].append(field)
 
+    # Save to Firestore
     try:
         saveProductToFirestore(product_data)
     except Exception as e:
-        print(f"❌ Firestore save failed: {str(e)}")
-        return jsonify({"error": "Failed to save to database"}), 500
+        print(f"⚠️ Firestore save failed: {e}")
+        return jsonify({"error": "Failed to save to Firestore"}), 500
 
     return jsonify(product_data)
 
