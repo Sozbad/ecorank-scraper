@@ -4,7 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 import firebase_admin
 from firebase_admin import credentials, firestore
-from googlesearch import search
 from PyPDF2 import PdfReader
 from openai import OpenAI
 from utils.image_and_description import get_image_and_description
@@ -16,21 +15,26 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
+# Init GPT API
 openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def extract_sds_data(url):
+# --- Helper: extract hazard + disposal from SDS page ---
+def extract_sds_data(sds_url):
     text = ""
-    if url.endswith(".pdf"):
-        response = requests.get(url)
-        with open("temp_sds.pdf", "wb") as f:
-            f.write(response.content)
-        reader = PdfReader("temp_sds.pdf")
-        for page in reader.pages:
-            text += page.extract_text()
-    else:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.text, "html.parser")
-        text = soup.get_text(separator="\n")
+    try:
+        if sds_url.endswith(".pdf"):
+            response = requests.get(sds_url)
+            with open("temp_sds.pdf", "wb") as f:
+                f.write(response.content)
+            reader = PdfReader("temp_sds.pdf")
+            for page in reader.pages:
+                text += page.extract_text()
+        else:
+            response = requests.get(sds_url)
+            soup = BeautifulSoup(response.text, "html.parser")
+            text = soup.get_text(separator="\n")
+    except Exception:
+        return [], "not found", ""
 
     hazard_lines = re.findall(r"(Causes.*|May cause.*|Fatal.*|H\d{3})", text, re.IGNORECASE)
     hazards = list(set([map_phrase_to_hcode(line) for line in hazard_lines if map_phrase_to_hcode(line)]))
@@ -39,17 +43,35 @@ def extract_sds_data(url):
     disposal = disposal_match.group(1).strip() if disposal_match else "not found"
     return hazards, disposal, text
 
-def get_gpt_swaps(name, hazard_list):
-    prompt = f"""You are EcoRank, an expert in product safety and environmental impact.
-The product "{name}" has these hazard codes: {', '.join(hazard_list)}.
+# --- GPT to find real SDS URL ---
+def get_sds_link_via_gpt(product_name):
+    prompt = f"""Find the most reliable public SDS (Safety Data Sheet) link for the following product:
+Product: "{product_name}"
 
-Suggest 2–3 safer commercial alternatives that:
+Please return ONLY the direct URL to the SDS file — PDF or SDS viewer page — with no extra commentary."""
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        url = re.search(r"(https?://[^\s]+)", resp.choices[0].message.content.strip())
+        return url.group(1) if url else None
+    except Exception:
+        return None
+
+# --- GPT: suggest greener swaps ---
+def get_gpt_swaps(name, hazard_list):
+    if not hazard_list:
+        return []
+    prompt = f"""The product "{name}" has hazard codes: {', '.join(hazard_list)}.
+
+Suggest 2–3 greener, safer commercial alternatives that:
 - Serve the same function
 - Have fewer or no hazard codes
 - Are real products from known brands
-- Prefer those with eco-certifications if known
+- Prefer eco-certified products if possible
 
-Only return product names, not explanations."""
+Only return product names, no explanation."""
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o",
@@ -57,27 +79,24 @@ Only return product names, not explanations."""
         )
         lines = resp.choices[0].message.content.strip().splitlines()
         return [line.strip("-• ") for line in lines if len(line.strip()) > 2]
-    except:
+    except Exception:
         return []
 
+# --- Main handler ---
 def handle_search(product_name):
     doc_id = product_name.lower()
     doc_ref = db.collection("products").document(doc_id)
     if doc_ref.get().exists:
         return {"status": "exists", "message": "Already in database"}
 
-    urls = list(search(f"{product_name} SDS filetype:pdf", num_results=20))
-    sds_url = next((u for u in urls if "sds" in u.lower()), None)
-
+    sds_url = get_sds_link_via_gpt(product_name)
     hazards, disposal, raw_text = [], "not found", ""
     source = "GPT estimate"
+
     if sds_url:
-        try:
-            hazards, disposal, raw_text = extract_sds_data(sds_url)
-            if hazards or disposal != "not found":
-                source = "Verified SDS"
-        except:
-            pass
+        hazards, disposal, raw_text = extract_sds_data(sds_url)
+        if hazards or disposal != "not found":
+            source = "Verified SDS"
 
     if not hazards:
         hazards += re.findall(r"H\d{3}", raw_text)
@@ -93,7 +112,7 @@ def handle_search(product_name):
         "image": image or "/icons/placeholder.svg",
         "sds_url": sds_url or "not found",
         "swaps": swaps,
-        "missingFields": len(hazards) == 0 or disposal == "not found",
+        "missingFields": [k for k in ["hazards", "disposal", "description", "image"] if eval(k) in ([], "not found", None)],
         "source": source,
         "verified": source == "Verified SDS"
     })
@@ -104,5 +123,6 @@ def handle_search(product_name):
         "disposal": disposal,
         "swaps": swaps,
         "image": image,
+        "sds_url": sds_url,
         "source": source
     }
